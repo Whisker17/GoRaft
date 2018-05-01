@@ -5,6 +5,11 @@ import (
 	"sync"
 )
 
+/*
+*1.获取一个url内容的同时处理另一个url
+*2.每个url保证仅处理一次，避免浪费带宽，需要机制记录url的访问记录
+ */
+
 var fetcher = fakeFetcher{
 	"http://golang.org/": &fakeResult{
 		"The Go Programming Language",
@@ -78,6 +83,7 @@ func Serial(url string, fetcher Fetcher, fetched map[string]bool) {
 	return
 }
 
+//实现并发
 func ConcurrentMutex(url string, fetcher Fetcher, f *fetchState) {
 	f.mu.Lock()
 	if f.fetched[url] {

@@ -11,6 +11,13 @@ import (
 	"time"
 )
 
+/*
+*类似于Go的RPC系统，但是带有模拟网络
+*1.这个模拟网络会延迟请求和回复
+*2.这个模拟网络会丢失请求和回复
+*3.这个模拟网络会重新排序请求和回复
+ */
+
 type reqMsg struct {
 	endname  interface{}
 	svcMeth  string
@@ -26,9 +33,13 @@ type replyMsg struct {
 
 type ClientEnd struct {
 	endname interface{}
-	ch      chan reqMsg
+	ch      chan reqMsg //Network.endCh的副本
 }
 
+//发送一个RPC，等待回复
+//使用反射查找参数类型，使用“gob”序列化参数
+//ClientEnd.ch（chan reqMsg）是用于发送请求的通道 e.ch <- req
+//需要一个通道从接收回复(<- req.replyCh)
 func (e *ClientEnd) Call(svcMeth string, args interface{}, reply interface{}) bool {
 	req := reqMsg{}
 	req.endname = e.endname
@@ -59,7 +70,7 @@ func (e *ClientEnd) Call(svcMeth string, args interface{}, reply interface{}) bo
 type Network struct {
 	mu             sync.Mutex
 	reliable       bool
-	longDelays     bool
+	longDelays     bool //在无法连接时暂停一下
 	longReordering bool
 	ends           map[interface{}]*ClientEnd
 	enabled        map[interface{}]bool
@@ -68,6 +79,7 @@ type Network struct {
 	endCh          chan reqMsg
 }
 
+//新建一个Network
 func MakeNetwork() *Network {
 	rn := &Network{}
 	rn.reliable = true
@@ -107,6 +119,7 @@ func (rn *Network) LongDelays(yes bool) {
 	rn.longDelays = yes
 }
 
+//读取端信息
 func (rn *Network) ReadEndnameInfo(endname interface{}) (enabled bool,
 	servername interface{}, server *Server, reliable bool, longreordering bool) {
 	rn.mu.Lock()
@@ -122,6 +135,7 @@ func (rn *Network) ReadEndnameInfo(endname interface{}) (enabled bool,
 	return
 }
 
+//判断服务器是否宕机
 func (rn *Network) IsServerDead(endname interface{}, servername interface{}, server *Server) bool {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
@@ -132,26 +146,31 @@ func (rn *Network) IsServerDead(endname interface{}, servername interface{}, ser
 	return false
 }
 
+//处理request
 func (rn *Network) ProcessReq(req reqMsg) {
 	enabled, servername, server, reliable, longreordering := rn.ReadEndnameInfo(req.endname)
 
 	if enabled && servername != nil && server != nil {
+		//小的延迟
 		if reliable == false {
 			ms := (rand.Int() % 27)
 			time.Sleep(time.Duration(ms) * time.Millisecond)
 		}
 
+		//取消request
 		if reliable == false && (rand.Int()%1000) < 100 {
 			req.replyCh <- replyMsg{false, nil}
 			return
 		}
 
+		//并发执行
 		ech := make(chan replyMsg)
 		go func() {
 			r := server.dispatch(req)
 			ech <- r
 		}()
 
+		//不断等待消息
 		var reply replyMsg
 		replyOK := false
 		serverDead := false
@@ -178,6 +197,7 @@ func (rn *Network) ProcessReq(req reqMsg) {
 			req.replyCh <- reply
 		}
 	} else {
+		//如果没有回复，直到响应时间用完
 		ms := 0
 		if rn.longDelays {
 			ms = (rand.Int() % 7000)
@@ -189,6 +209,7 @@ func (rn *Network) ProcessReq(req reqMsg) {
 	}
 }
 
+//创造一个端节点，增加一个线程
 func (rn *Network) MakeEnd(endname interface{}) *ClientEnd {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
@@ -207,6 +228,7 @@ func (rn *Network) MakeEnd(endname interface{}) *ClientEnd {
 	return e
 }
 
+//增加一台服务器
 func (rn *Network) AddServer(servername interface{}, rs *Server) {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
@@ -214,6 +236,7 @@ func (rn *Network) AddServer(servername interface{}, rs *Server) {
 	rn.servers[servername] = rs
 }
 
+//删除一台服务器
 func (rn *Network) DeleteServer(servername interface{}) {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
@@ -221,6 +244,8 @@ func (rn *Network) DeleteServer(servername interface{}) {
 	rn.servers[servername] = nil
 }
 
+//将客户端与服务器相连
+//在一个生命周期中只能相连一次
 func (rn *Network) Connect(endname interface{}, servername interface{}) {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
@@ -228,6 +253,7 @@ func (rn *Network) Connect(endname interface{}, servername interface{}) {
 	rn.connections[endname] = servername
 }
 
+//使能一个客户端
 func (rn *Network) Enable(endname interface{}, enabled bool) {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
@@ -235,6 +261,7 @@ func (rn *Network) Enable(endname interface{}, enabled bool) {
 	rn.enabled[endname] = enabled
 }
 
+//统计服务器中的RPC数量
 func (rn *Network) GetCount(servername interface{}) int {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
@@ -246,18 +273,22 @@ func (rn *Network) GetCount(servername interface{}) int {
 /*
 *Server
  */
+
+//服务器是服务的集合，其服务共享相同的rpc dispatcher
 type Server struct {
 	mu       sync.Mutex
 	services map[string]*Service
 	count    int
 }
 
+//创建一个服务器
 func MakeServer() *Server {
 	rs := &Server{}
 	rs.services = map[string]*Service{}
 	return rs
 }
 
+//增加服务，可以被多个goroutine调用（因为有解锁机制）
 func (rs *Server) AddService(svc *Service) {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
@@ -265,11 +296,13 @@ func (rs *Server) AddService(svc *Service) {
 	rs.services[svc.name] = svc
 }
 
+//分发请求
 func (rs *Server) dispatch(req reqMsg) replyMsg {
 	rs.mu.Lock()
 
-	rs.count = 1
+	rs.count += 1
 
+	//分割svcMeth，分为service和method
 	dot := strings.LastIndex(req.svcMeth, ".")
 	serviceName := req.svcMeth[:dot]
 	methodName := req.svcMeth[dot+1:]
@@ -297,6 +330,7 @@ func (rs *Server) GetCount() int {
 	return rs.count
 }
 
+//一个服务器可能包含多个服务
 type Service struct {
 	name    string
 	rcvr    reflect.Value
@@ -304,6 +338,7 @@ type Service struct {
 	methods map[string]reflect.Method
 }
 
+//创建一个新的服务
 func MakeService(rcvr interface{}) *Service {
 	svc := &Service{}
 	svc.typ = reflect.TypeOf(rcvr)
@@ -335,6 +370,7 @@ func (svc *Service) dispatch(methname string, req reqMsg) replyMsg {
 	if method, ok := svc.methods[methname]; ok {
 		args := reflect.New(req.argsType)
 
+		//解码一个参数
 		ab := bytes.NewBuffer(req.args)
 		ad := gob.NewDecoder(ab)
 		ad.Decode(args.Interface())
